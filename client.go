@@ -106,13 +106,13 @@ type Hit struct {
 
 // SearchStats reports query execution telemetry.
 type SearchStats struct {
-	TotalBlocks      int `json:"TotalBlocks"`
-	SkippedByTenant  int `json:"SkippedByTenant"`
-	SkippedByDate    int `json:"SkippedByDate"`
-	SkippedByCat     int `json:"SkippedByCat"`
-	ScannedBlocks    int `json:"ScannedBlocks"`
-	ScannedVectors   int `json:"ScannedVectors"`
-	RerankedVectors  int `json:"RerankedVectors"`
+	TotalBlocks     int `json:"TotalBlocks"`
+	SkippedByTenant int `json:"SkippedByTenant"`
+	SkippedByDate   int `json:"SkippedByDate"`
+	SkippedByCat    int `json:"SkippedByCat"`
+	ScannedBlocks   int `json:"ScannedBlocks"`
+	ScannedVectors  int `json:"ScannedVectors"`
+	RerankedVectors int `json:"RerankedVectors"`
 }
 
 // SearchResponse is returned by Search.
