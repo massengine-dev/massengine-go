@@ -5,7 +5,7 @@ Official zero-dependency Go client for [MassEngine](https://massengine.com) — 
 ## Installation
 
 ```bash
-go get github.com/massengine-dev/massengine-go@v1.1.0
+go get github.com/massengine-dev/massengine-go@v1.1.2
 ```
 
 ## Quickstart

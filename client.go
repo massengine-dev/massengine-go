@@ -19,7 +19,7 @@ import (
 
 const (
 	// Version is the semantic version of this SDK release.
-	Version = "1.1.0"
+	Version = "1.1.2"
 
 	defaultUserAgent        = "massengine-go/" + Version
 	defaultBaseURL          = "http://localhost:8081"
