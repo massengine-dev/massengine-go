@@ -1,5 +1,5 @@
 // Package massengine provides the official Go client SDK for the MassEngine
-// vector and hybrid search REST API.
+// filtered vector search REST API.
 package massengine
 
 import (
@@ -19,7 +19,7 @@ import (
 
 const (
 	// Version is the semantic version of this SDK release.
-	Version = "1.1.2"
+	Version = "1.1.4"
 
 	defaultUserAgent        = "massengine-go/" + Version
 	defaultBaseURL          = "http://localhost:8081"
@@ -186,11 +186,58 @@ func escapeTenant(tenant string) (string, error) {
 	return escapeSegment(tenant)
 }
 
+func escapeDatabase(database string) (string, error) {
+	if strings.ContainsAny(database, `/\`) {
+		return "", errors.New("massengine: invalid database identifier")
+	}
+	return escapeSegment(database)
+}
+
+func resolveOptionalDatabase(database []string) (string, error) {
+	if len(database) > 1 {
+		return "", errors.New("massengine: at most one database name may be specified")
+	}
+	if len(database) == 0 || database[0] == "" {
+		return "", nil
+	}
+	if _, err := escapeDatabase(database[0]); err != nil {
+		return "", err
+	}
+	return database[0], nil
+}
+
 func escapeDocID(id string) (string, error) {
+	if id == "" {
+		return "", errors.New("massengine: document identifier is required")
+	}
 	if id == "batch-get" {
 		return "", errors.New("massengine: reserved document identifier")
 	}
-	return escapeSegment(id)
+	parts := strings.Split(id, "/")
+	escaped := make([]string, len(parts))
+	for i, part := range parts {
+		esc, err := escapeSegment(part)
+		if err != nil {
+			return "", err
+		}
+		escaped[i] = esc
+	}
+	return strings.Join(escaped, "/"), nil
+}
+
+func validateDocID(id string) error {
+	_, err := escapeDocID(id)
+	return err
+}
+
+func appendDatabaseQuery(basePath, database string) (string, error) {
+	if database == "" {
+		return basePath, nil
+	}
+	if _, err := escapeDatabase(database); err != nil {
+		return "", err
+	}
+	return basePath + "?database=" + url.QueryEscape(database), nil
 }
 
 // APIError is returned when the server responds with a non-2xx HTTP status.
@@ -206,25 +253,26 @@ func (e *APIError) Error() string {
 // Doc represents a document submitted via Ingest or ImportTenant.
 type Doc struct {
 	ID       string          `json:"id"`
+	Database string          `json:"database,omitempty"`
 	Vector   []float32       `json:"vector"`
 	Date     uint16          `json:"date,omitempty"`
 	Category uint16          `json:"category,omitempty"`
 	Metadata json.RawMessage `json:"metadata,omitempty"`
 }
 
-// IngestResponse is returned by Ingest.
+// IngestResponse is returned by Ingest and IngestDatabase.
 type IngestResponse struct {
-	Ingested int  `json:"ingested"`
-	Degraded bool `json:"degraded"`
+	Ingested int    `json:"ingested"`
+	Degraded bool   `json:"degraded"`
+	Database string `json:"database,omitempty"`
 }
 
-// SearchRequest specifies a vector, lexical, or hybrid query with optional
-// pre-filters, similarity threshold, and pagination offset.
+// SearchRequest specifies a dense vector query with optional database scope,
+// metadata/date/category pre-filters, similarity threshold, and pagination offset.
 type SearchRequest struct {
-	Tenant         string         `json:"tenant"`
-	Vector         []float32      `json:"vector,omitempty"`
-	QueryText      string         `json:"query_text,omitempty"`
-	HybridAlpha    float32        `json:"hybrid_alpha,omitempty"`
+	Tenant         string         `json:"tenant,omitempty"`
+	Database       string         `json:"database,omitempty"`
+	Vector         []float32      `json:"vector"`
 	MetadataFilter map[string]any `json:"metadata_filter,omitempty"`
 	K              int            `json:"k"`
 	Offset         int            `json:"offset,omitempty"`
@@ -261,6 +309,7 @@ type BatchSearchResponse struct {
 type DocResponse struct {
 	ID       string          `json:"id"`
 	Tenant   string          `json:"tenant,omitempty"`
+	Database string          `json:"database,omitempty"`
 	Date     uint16          `json:"date,omitempty"`
 	Category uint16          `json:"category,omitempty"`
 	Found    bool            `json:"found"`
@@ -271,50 +320,106 @@ type DocResponse struct {
 // PatchRequest specifies an in-place metadata, date, or category update without
 // re-embedding the document vector.
 type PatchRequest struct {
+	Database    string          `json:"database,omitempty"`
 	Date        *uint16         `json:"date,omitempty"`
 	Category    *uint16         `json:"category,omitempty"`
 	Metadata    json.RawMessage `json:"metadata,omitempty"`
 	ReplaceMeta bool            `json:"replace_metadata,omitempty"`
 }
 
-// TenantSummary describes a tenant's document and storage volume.
-type TenantSummary struct {
-	Tenant    string `json:"tenant"`
-	DocCount  uint64 `json:"doc_count"`
-	ByteCount uint64 `json:"byte_count,omitempty"`
+// DatabaseConfig specifies configuration options when creating or updating a
+// named database within a tenant.
+type DatabaseConfig struct {
+	Database  string `json:"database"`
+	NumShards int    `json:"num_shards,omitempty"`
+	RF        int    `json:"rf,omitempty"`
+	Mode      string `json:"mode,omitempty"`
+	DataType  string `json:"data_type,omitempty"`
 }
 
-// TenantQuota defines a tenant's plan tier, document capacity limit, QPS rate
-// limit, and billing suspension state.
+// DatabaseInfo describes a database's routing configuration and storage volume.
+type DatabaseInfo struct {
+	Tenant         string `json:"tenant"`
+	Database       string `json:"database,omitempty"`
+	Partition      string `json:"partition,omitempty"`
+	Tag            uint32 `json:"tag,omitempty"`
+	Mode           string `json:"mode,omitempty"`
+	PinnedShard    int    `json:"pinned_shard"`
+	NumShards      int    `json:"num_shards,omitempty"`
+	RF             int    `json:"rf,omitempty"`
+	DataType       string `json:"data_type,omitempty"`
+	ExplicitShards bool   `json:"explicit_shards,omitempty"`
+	DocCount       uint64 `json:"doc_count"`
+	ByteCount      uint64 `json:"byte_count,omitempty"`
+}
+
+// TenantSummary describes a tenant's document and storage volume.
+type TenantSummary struct {
+	Tenant      string `json:"tenant"`
+	Database    string `json:"database,omitempty"`
+	Partition   string `json:"partition,omitempty"`
+	Mode        string `json:"mode,omitempty"`
+	PinnedShard int    `json:"pinned_shard,omitempty"`
+	NumShards   int    `json:"num_shards,omitempty"`
+	RF          int    `json:"rf,omitempty"`
+	DataType    string `json:"data_type,omitempty"`
+	DocCount    uint64 `json:"doc_count"`
+	ByteCount   uint64 `json:"byte_count,omitempty"`
+}
+
+// TenantQuota defines a tenant's plan tier, document and byte capacity limits,
+// QPS rate limit, and billing suspension state.
 type TenantQuota struct {
 	Plan      string  `json:"plan,omitempty"`
 	MaxDocs   uint64  `json:"max_docs,omitempty"`
+	MaxBytes  uint64  `json:"max_bytes,omitempty"`
 	MaxQPS    float64 `json:"max_qps,omitempty"`
 	Burst     int     `json:"burst,omitempty"`
 	Suspended bool    `json:"suspended,omitempty"`
 }
 
-// TenantUsage reports cumulative billable read/write counters and capacity
-// utilization for a single tenant.
+// LatencyBucket represents one cumulative histogram bucket in LatencyStats.
+type LatencyBucket struct {
+	LeMs  string `json:"le_ms"`
+	Count uint64 `json:"count"`
+}
+
+// LatencyStats summarizes search latency percentiles and histogram buckets.
+type LatencyStats struct {
+	Count   uint64          `json:"count"`
+	AvgMs   float64         `json:"avg_ms"`
+	P50Ms   float64         `json:"p50_ms"`
+	P95Ms   float64         `json:"p95_ms"`
+	P99Ms   float64         `json:"p99_ms"`
+	Buckets []LatencyBucket `json:"buckets,omitempty"`
+}
+
+// TenantUsage reports cumulative billable read/write counters, logical byte
+// footprint, and search latency percentiles for a single tenant.
 type TenantUsage struct {
-	Tenant        string  `json:"tenant"`
-	Plan          string  `json:"plan,omitempty"`
-	Suspended     bool    `json:"suspended,omitempty"`
-	LiveDocs      uint64  `json:"live_docs"`
-	MaxDocs       uint64  `json:"max_docs,omitempty"`
-	MaxQPS        float64 `json:"max_qps,omitempty"`
-	ReadRequests  uint64  `json:"read_requests"`
-	ReadUnits     uint64  `json:"read_units"`
-	WriteRequests uint64  `json:"write_requests"`
-	WriteUnits    uint64  `json:"write_units"`
-	RateLimited   uint64  `json:"rate_limited"`
-	UpdatedAt     string  `json:"updated_at,omitempty"`
+	Tenant         string       `json:"tenant"`
+	Plan           string       `json:"plan,omitempty"`
+	Suspended      bool         `json:"suspended,omitempty"`
+	PartitionCount int          `json:"partition_count"`
+	LiveDocs       uint64       `json:"live_docs"`
+	LiveBytes      uint64       `json:"live_bytes"`
+	MaxDocs        uint64       `json:"max_docs,omitempty"`
+	MaxBytes       uint64       `json:"max_bytes,omitempty"`
+	MaxQPS         float64      `json:"max_qps,omitempty"`
+	ReadRequests   uint64       `json:"read_requests"`
+	ReadUnits      uint64       `json:"read_units"`
+	WriteRequests  uint64       `json:"write_requests"`
+	WriteUnits     uint64       `json:"write_units"`
+	RateLimited    uint64       `json:"rate_limited"`
+	SearchLatency  LatencyStats `json:"search_latency"`
+	UpdatedAt      string       `json:"updated_at,omitempty"`
 }
 
 // UsageReport aggregates per-tenant usage across the cluster.
 type UsageReport struct {
 	Tenants         []TenantUsage `json:"tenants"`
 	TotalLiveDocs   uint64        `json:"total_live_docs"`
+	TotalLiveBytes  uint64        `json:"total_live_bytes"`
 	TotalReadUnits  uint64        `json:"total_read_units"`
 	TotalWriteUnits uint64        `json:"total_write_units"`
 }
@@ -325,23 +430,90 @@ type ReadyStatus struct {
 	UnavailableShards []int `json:"unavailable_shards,omitempty"`
 }
 
-// Ingest writes or upserts a batch of documents for tenant.
-func (c *Client) Ingest(ctx context.Context, tenant string, docs []Doc) (*IngestResponse, error) {
-	escTenant, err := escapeTenant(tenant)
+func validateDocs(docs []Doc) error {
+	for i := range docs {
+		if err := validateDocID(docs[i].ID); err != nil {
+			return fmt.Errorf("doc %d: %w", i, err)
+		}
+		if docs[i].Database != "" {
+			if _, err := escapeDatabase(docs[i].Database); err != nil {
+				return fmt.Errorf("doc %d: %w", i, err)
+			}
+		}
+	}
+	return nil
+}
+
+// Ingest writes or upserts a batch of documents for tenant (or the tenant
+// bound to a tenant-scoped mk_... API key when tenant is empty), with an
+// optional target database name.
+func (c *Client) Ingest(ctx context.Context, tenant string, docs []Doc, database ...string) (*IngestResponse, error) {
+	db, err := resolveOptionalDatabase(database)
 	if err != nil {
 		return nil, err
 	}
+	return c.IngestDatabase(ctx, tenant, db, docs)
+}
+
+// IngestDatabase writes or upserts a batch of documents into the specified
+// database for tenant (or into the bound mk_... key's tenant when tenant is empty).
+func (c *Client) IngestDatabase(ctx context.Context, tenant, database string, docs []Doc) (*IngestResponse, error) {
+	if c.initErr != nil {
+		return nil, c.initErr
+	}
+	path := "/v1/ingest"
+	if tenant != "" {
+		escTenant, err := escapeTenant(tenant)
+		if err != nil {
+			return nil, err
+		}
+		path = fmt.Sprintf("/v1/tenants/%s/ingest", escTenant)
+	}
+	if database != "" {
+		if _, err := escapeDatabase(database); err != nil {
+			return nil, err
+		}
+	}
+	if err := validateDocs(docs); err != nil {
+		return nil, err
+	}
 	body := map[string]any{"docs": docs}
+	if database != "" {
+		body["database"] = database
+	}
 	var out IngestResponse
-	path := fmt.Sprintf("/v1/tenants/%s/ingest", escTenant)
 	if err := c.doJSON(ctx, http.MethodPost, path, body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
 }
 
-// Search executes a single vector, lexical, or hybrid query.
+func validateSearchRequest(req SearchRequest) error {
+	if len(req.Vector) == 0 {
+		return errors.New("massengine: search vector must be non-empty")
+	}
+	if req.Tenant != "" {
+		if _, err := escapeTenant(req.Tenant); err != nil {
+			return err
+		}
+	}
+	if req.Database != "" {
+		if _, err := escapeDatabase(req.Database); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Search executes a single dense vector query with optional metadata, date, and
+// category filters.
 func (c *Client) Search(ctx context.Context, req SearchRequest) (*SearchResponse, error) {
+	if c.initErr != nil {
+		return nil, c.initErr
+	}
+	if err := validateSearchRequest(req); err != nil {
+		return nil, err
+	}
 	var out SearchResponse
 	if err := c.doJSON(ctx, http.MethodPost, "/v1/search", req, &out); err != nil {
 		return nil, err
@@ -349,9 +521,28 @@ func (c *Client) Search(ctx context.Context, req SearchRequest) (*SearchResponse
 	return &out, nil
 }
 
-// BatchSearch executes multiple queries in a single round-trip.
-func (c *Client) BatchSearch(ctx context.Context, queries []SearchRequest) (*BatchSearchResponse, error) {
+// BatchSearch executes multiple dense vector queries in a single round-trip,
+// with an optional batch-level default database name.
+func (c *Client) BatchSearch(ctx context.Context, queries []SearchRequest, database ...string) (*BatchSearchResponse, error) {
+	if c.initErr != nil {
+		return nil, c.initErr
+	}
+	db, err := resolveOptionalDatabase(database)
+	if err != nil {
+		return nil, err
+	}
+	if len(queries) == 0 {
+		return nil, errors.New("massengine: batch search queries must be non-empty")
+	}
+	for i := range queries {
+		if err := validateSearchRequest(queries[i]); err != nil {
+			return nil, fmt.Errorf("query %d: %w", i, err)
+		}
+	}
 	body := map[string]any{"queries": queries}
+	if db != "" {
+		body["database"] = db
+	}
 	var out BatchSearchResponse
 	if err := c.doJSON(ctx, http.MethodPost, "/v1/search/batch", body, &out); err != nil {
 		return nil, err
@@ -359,17 +550,32 @@ func (c *Client) BatchSearch(ctx context.Context, queries []SearchRequest) (*Bat
 	return &out, nil
 }
 
-// GetDoc fetches a document's metadata by ID.
-func (c *Client) GetDoc(ctx context.Context, tenant, id string) (*DocResponse, error) {
-	escTenant, err := escapeTenant(tenant)
-	if err != nil {
-		return nil, err
-	}
+func docEndpointPath(tenant, id, database string) (string, error) {
 	escID, err := escapeDocID(id)
 	if err != nil {
+		return "", err
+	}
+	base := "/v1/docs/" + escID
+	if tenant != "" {
+		escTenant, err := escapeTenant(tenant)
+		if err != nil {
+			return "", err
+		}
+		base = fmt.Sprintf("/v1/tenants/%s/docs/%s", escTenant, escID)
+	}
+	return appendDatabaseQuery(base, database)
+}
+
+// GetDoc fetches a document's metadata by ID, optionally scoped to database.
+func (c *Client) GetDoc(ctx context.Context, tenant, id string, database ...string) (*DocResponse, error) {
+	db, err := resolveOptionalDatabase(database)
+	if err != nil {
 		return nil, err
 	}
-	path := fmt.Sprintf("/v1/tenants/%s/docs/%s", escTenant, escID)
+	path, err := docEndpointPath(tenant, id, db)
+	if err != nil {
+		return nil, err
+	}
 	var out DocResponse
 	if err := c.doJSON(ctx, http.MethodGet, path, nil, &out); err != nil {
 		return nil, err
@@ -380,16 +586,23 @@ func (c *Client) GetDoc(ctx context.Context, tenant, id string) (*DocResponse, e
 
 // PatchDoc updates an existing document's metadata, date, or category in place
 // without re-supplying its vector.
-func (c *Client) PatchDoc(ctx context.Context, tenant, id string, req PatchRequest) (*DocResponse, error) {
-	escTenant, err := escapeTenant(tenant)
+func (c *Client) PatchDoc(ctx context.Context, tenant, id string, req PatchRequest, database ...string) (*DocResponse, error) {
+	db, err := resolveOptionalDatabase(database)
 	if err != nil {
 		return nil, err
 	}
-	escID, err := escapeDocID(id)
+	if db != "" && req.Database == "" {
+		req.Database = db
+	}
+	if req.Database != "" {
+		if _, err := escapeDatabase(req.Database); err != nil {
+			return nil, err
+		}
+	}
+	path, err := docEndpointPath(tenant, id, "")
 	if err != nil {
 		return nil, err
 	}
-	path := fmt.Sprintf("/v1/tenants/%s/docs/%s", escTenant, escID)
 	var out DocResponse
 	if err := c.doJSON(ctx, http.MethodPatch, path, req, &out); err != nil {
 		return nil, err
@@ -398,13 +611,29 @@ func (c *Client) PatchDoc(ctx context.Context, tenant, id string, req PatchReque
 	return &out, nil
 }
 
-// ImportTenant streams a slice of documents as NDJSON into tenant.
-func (c *Client) ImportTenant(ctx context.Context, tenant string, docs []Doc) (int, error) {
+// ImportTenant streams a slice of documents as NDJSON into tenant (or the bound
+// mk_... key's tenant when tenant is empty), optionally scoped to database.
+func (c *Client) ImportTenant(ctx context.Context, tenant string, docs []Doc, database ...string) (int, error) {
 	if c.initErr != nil {
 		return 0, c.initErr
 	}
-	escTenant, err := escapeTenant(tenant)
+	db, err := resolveOptionalDatabase(database)
 	if err != nil {
+		return 0, err
+	}
+	basePath := "/v1/import"
+	if tenant != "" {
+		escTenant, err := escapeTenant(tenant)
+		if err != nil {
+			return 0, err
+		}
+		basePath = fmt.Sprintf("/v1/tenants/%s/import", escTenant)
+	}
+	path, err := appendDatabaseQuery(basePath, db)
+	if err != nil {
+		return 0, err
+	}
+	if err := validateDocs(docs); err != nil {
 		return 0, err
 	}
 	var buf bytes.Buffer
@@ -414,7 +643,6 @@ func (c *Client) ImportTenant(ctx context.Context, tenant string, docs []Doc) (i
 			return 0, err
 		}
 	}
-	path := fmt.Sprintf("/v1/tenants/%s/import", escTenant)
 	req, err := c.newRequest(ctx, http.MethodPost, path, &buf, "application/x-ndjson")
 	if err != nil {
 		return 0, err
@@ -440,16 +668,29 @@ func (c *Client) ImportTenant(ctx context.Context, tenant string, docs []Doc) (i
 	return out.Imported, nil
 }
 
-// ExportTenant streams all live documents belonging to tenant via NDJSON.
-func (c *Client) ExportTenant(ctx context.Context, tenant string) ([]Doc, error) {
+// ExportTenant streams all live documents belonging to tenant (or the bound
+// mk_... key's tenant when tenant is empty) via NDJSON, optionally filtered to
+// a single database.
+func (c *Client) ExportTenant(ctx context.Context, tenant string, database ...string) ([]Doc, error) {
 	if c.initErr != nil {
 		return nil, c.initErr
 	}
-	escTenant, err := escapeTenant(tenant)
+	db, err := resolveOptionalDatabase(database)
 	if err != nil {
 		return nil, err
 	}
-	path := fmt.Sprintf("/v1/tenants/%s/export", escTenant)
+	basePath := "/v1/export"
+	if tenant != "" {
+		escTenant, err := escapeTenant(tenant)
+		if err != nil {
+			return nil, err
+		}
+		basePath = fmt.Sprintf("/v1/tenants/%s/export", escTenant)
+	}
+	path, err := appendDatabaseQuery(basePath, db)
+	if err != nil {
+		return nil, err
+	}
 	req, err := c.newRequest(ctx, http.MethodGet, path, nil, "")
 	if err != nil {
 		return nil, err
@@ -497,6 +738,148 @@ func (c *Client) ExportTenant(ctx context.Context, tenant string) ([]Doc, error)
 	return docs, nil
 }
 
+// ListDatabases lists all databases configured under tenant (or under the bound
+// mk_... key's tenant when tenant is empty).
+func (c *Client) ListDatabases(ctx context.Context, tenant string) ([]DatabaseInfo, error) {
+	path := "/v1/databases"
+	if tenant != "" {
+		escTenant, err := escapeTenant(tenant)
+		if err != nil {
+			return nil, err
+		}
+		path = fmt.Sprintf("/v1/tenants/%s/databases", escTenant)
+	}
+	var resp struct {
+		Databases  []DatabaseInfo `json:"databases"`
+		Partitions []DatabaseInfo `json:"partitions"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &resp); err != nil {
+		return nil, err
+	}
+	if len(resp.Databases) > 0 {
+		return resp.Databases, nil
+	}
+	return resp.Partitions, nil
+}
+
+// CreateDatabase creates or updates a named database under tenant (or under the
+// bound mk_... key's tenant when tenant is empty).
+func (c *Client) CreateDatabase(ctx context.Context, tenant string, cfg DatabaseConfig) (*DatabaseInfo, error) {
+	if _, err := escapeDatabase(cfg.Database); err != nil {
+		return nil, err
+	}
+	path := "/v1/databases"
+	if tenant != "" {
+		escTenant, err := escapeTenant(tenant)
+		if err != nil {
+			return nil, err
+		}
+		path = fmt.Sprintf("/v1/tenants/%s/databases", escTenant)
+	}
+	var resp struct {
+		Database  DatabaseInfo `json:"database"`
+		Partition string       `json:"partition"`
+	}
+	if err := c.doJSON(ctx, http.MethodPost, path, cfg, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Database.Database == "" {
+		if resp.Partition != "" {
+			resp.Database.Database = resp.Partition
+		} else {
+			resp.Database.Database = cfg.Database
+		}
+	}
+	return &resp.Database, nil
+}
+
+// GetDatabase fetches metadata and volume statistics for a single named database.
+func (c *Client) GetDatabase(ctx context.Context, tenant, database string) (*DatabaseInfo, error) {
+	if c.initErr != nil {
+		return nil, c.initErr
+	}
+	escDB, err := escapeDatabase(database)
+	if err != nil {
+		return nil, err
+	}
+	path := "/v1/databases/" + escDB
+	if tenant != "" {
+		escTenant, err := escapeTenant(tenant)
+		if err != nil {
+			return nil, err
+		}
+		path = fmt.Sprintf("/v1/tenants/%s/databases/%s", escTenant, escDB)
+	}
+
+	req, err := c.newRequest(ctx, http.MethodGet, path, nil, "")
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusMethodNotAllowed {
+		drainAndClose(resp.Body)
+		dbs, listErr := c.ListDatabases(ctx, tenant)
+		if listErr != nil {
+			return nil, listErr
+		}
+		for i := range dbs {
+			if dbs[i].Database == database || dbs[i].Partition == database {
+				return &dbs[i], nil
+			}
+		}
+		return nil, &APIError{StatusCode: http.StatusNotFound, Message: "database not found"}
+	}
+	defer drainAndClose(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, decodeAPIError(resp)
+	}
+	raw, err := readBounded(resp.Body, c.maxResponseBytes)
+	if err != nil {
+		return nil, err
+	}
+	var probe struct {
+		Database json.RawMessage `json:"database"`
+	}
+	var out DatabaseInfo
+	if json.Unmarshal(raw, &probe) == nil && len(bytes.TrimSpace(probe.Database)) > 0 && bytes.TrimSpace(probe.Database)[0] == '{' {
+		if err := json.Unmarshal(probe.Database, &out); err != nil {
+			return nil, err
+		}
+	} else if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, err
+	}
+	if out.Database == "" {
+		out.Database = database
+	}
+	return &out, nil
+}
+
+// DeleteDatabase purges all documents and routing state for a named database.
+func (c *Client) DeleteDatabase(ctx context.Context, tenant, database string) (int, error) {
+	escDB, err := escapeDatabase(database)
+	if err != nil {
+		return 0, err
+	}
+	path := "/v1/databases/" + escDB
+	if tenant != "" {
+		escTenant, err := escapeTenant(tenant)
+		if err != nil {
+			return 0, err
+		}
+		path = fmt.Sprintf("/v1/tenants/%s/databases/%s", escTenant, escDB)
+	}
+	var resp struct {
+		DocsDeleted int `json:"docs_deleted"`
+	}
+	if err := c.doJSON(ctx, http.MethodDelete, path, nil, &resp); err != nil {
+		return 0, err
+	}
+	return resp.DocsDeleted, nil
+}
+
 // CreateTenantKey registers (or generates if key is empty) a tenant-scoped
 // bearer API key. Requires the admin API key.
 func (c *Client) CreateTenantKey(ctx context.Context, tenant, key string) (string, error) {
@@ -526,8 +909,8 @@ func (c *Client) RevokeTenantKey(ctx context.Context, tenant, key string) error 
 	return c.doJSON(ctx, http.MethodDelete, path, body, nil)
 }
 
-// SetTenantQuota configures a tenant's plan tier, MaxDocs cap, MaxQPS limit,
-// and suspension state. Requires the admin API key.
+// SetTenantQuota configures a tenant's plan tier, MaxDocs/MaxBytes caps,
+// MaxQPS limit, and suspension state. Requires the admin API key.
 func (c *Client) SetTenantQuota(ctx context.Context, tenant string, quota TenantQuota) (*TenantQuota, error) {
 	escTenant, err := escapeTenant(tenant)
 	if err != nil {
@@ -559,8 +942,8 @@ func (c *Client) GetTenantQuota(ctx context.Context, tenant string) (*TenantQuot
 	return &resp.Quota, nil
 }
 
-// GetTenantUsage returns cumulative billable read/write counters and capacity
-// utilization for tenant.
+// GetTenantUsage returns cumulative billable read/write counters, byte footprint,
+// and search latency percentiles for tenant.
 func (c *Client) GetTenantUsage(ctx context.Context, tenant string) (*TenantUsage, error) {
 	escTenant, err := escapeTenant(tenant)
 	if err != nil {
@@ -584,14 +967,33 @@ func (c *Client) ListUsage(ctx context.Context) (*UsageReport, error) {
 	return &out, nil
 }
 
-// BatchGetDocs fetches multiple documents by ID in a single request.
-func (c *Client) BatchGetDocs(ctx context.Context, tenant string, ids []string) ([]DocResponse, error) {
-	escTenant, err := escapeTenant(tenant)
+// BatchGetDocs fetches multiple documents by ID in a single request, optionally
+// scoped to database.
+func (c *Client) BatchGetDocs(ctx context.Context, tenant string, ids []string, database ...string) ([]DocResponse, error) {
+	if c.initErr != nil {
+		return nil, c.initErr
+	}
+	db, err := resolveOptionalDatabase(database)
 	if err != nil {
 		return nil, err
 	}
-	path := fmt.Sprintf("/v1/tenants/%s/docs/batch-get", escTenant)
+	path := "/v1/docs/batch-get"
+	if tenant != "" {
+		escTenant, err := escapeTenant(tenant)
+		if err != nil {
+			return nil, err
+		}
+		path = fmt.Sprintf("/v1/tenants/%s/docs/batch-get", escTenant)
+	}
+	for i, id := range ids {
+		if err := validateDocID(id); err != nil {
+			return nil, fmt.Errorf("id %d: %w", i, err)
+		}
+	}
 	body := map[string]any{"ids": ids}
+	if db != "" {
+		body["database"] = db
+	}
 	var resp struct {
 		Docs []DocResponse `json:"docs"`
 	}
@@ -604,17 +1006,16 @@ func (c *Client) BatchGetDocs(ctx context.Context, tenant string, ids []string) 
 	return resp.Docs, nil
 }
 
-// DeleteDoc deletes a document by ID.
-func (c *Client) DeleteDoc(ctx context.Context, tenant, id string) error {
-	escTenant, err := escapeTenant(tenant)
+// DeleteDoc deletes a document by ID, optionally scoped to database.
+func (c *Client) DeleteDoc(ctx context.Context, tenant, id string, database ...string) error {
+	db, err := resolveOptionalDatabase(database)
 	if err != nil {
 		return err
 	}
-	escID, err := escapeDocID(id)
+	path, err := docEndpointPath(tenant, id, db)
 	if err != nil {
 		return err
 	}
-	path := fmt.Sprintf("/v1/tenants/%s/docs/%s", escTenant, escID)
 	return c.doJSON(ctx, http.MethodDelete, path, nil, nil)
 }
 
@@ -629,13 +1030,21 @@ func (c *Client) ListTenants(ctx context.Context) ([]TenantSummary, error) {
 	return resp.Tenants, nil
 }
 
-// GetTenant returns volume metadata for a single tenant.
-func (c *Client) GetTenant(ctx context.Context, tenant string) (*TenantSummary, error) {
+// GetTenant returns volume metadata for a single tenant (or database when
+// optional database is specified).
+func (c *Client) GetTenant(ctx context.Context, tenant string, database ...string) (*TenantSummary, error) {
+	db, err := resolveOptionalDatabase(database)
+	if err != nil {
+		return nil, err
+	}
 	escTenant, err := escapeTenant(tenant)
 	if err != nil {
 		return nil, err
 	}
-	path := fmt.Sprintf("/v1/tenants/%s", escTenant)
+	path, err := appendDatabaseQuery(fmt.Sprintf("/v1/tenants/%s", escTenant), db)
+	if err != nil {
+		return nil, err
+	}
 	var out TenantSummary
 	if err := c.doJSON(ctx, http.MethodGet, path, nil, &out); err != nil {
 		return nil, err
@@ -669,13 +1078,52 @@ func (c *Client) Compact(ctx context.Context) error {
 	return c.doJSON(ctx, http.MethodPost, "/v1/compact", nil, nil)
 }
 
-// Ready checks service readiness.
+// Health checks gateway liveness via GET /v1/health.
+func (c *Client) Health(ctx context.Context) (bool, error) {
+	var resp struct {
+		Status string `json:"status"`
+		OK     bool   `json:"ok"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, "/v1/health", nil, &resp); err != nil {
+		return false, err
+	}
+	s := strings.ToLower(strings.TrimSpace(resp.Status))
+	return resp.OK || s == "ok" || s == "healthy", nil
+}
+
+// Ready checks service readiness. Both HTTP 200 and HTTP 503 JSON readiness
+// payloads return a populated ReadyStatus without an error.
 func (c *Client) Ready(ctx context.Context) (*ReadyStatus, error) {
-	var out ReadyStatus
-	if err := c.doJSON(ctx, http.MethodGet, "/v1/ready", nil, &out); err != nil {
+	if c.initErr != nil {
+		return nil, c.initErr
+	}
+	req, err := c.newRequest(ctx, http.MethodGet, "/v1/ready", nil, "")
+	if err != nil {
 		return nil, err
 	}
-	return &out, nil
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer drainAndClose(resp.Body)
+	if (resp.StatusCode >= 200 && resp.StatusCode < 300) || resp.StatusCode == http.StatusServiceUnavailable {
+		raw, err := readBounded(resp.Body, c.maxResponseBytes)
+		if err != nil {
+			return nil, err
+		}
+		var probe struct {
+			Ready             *bool `json:"ready"`
+			UnavailableShards []int `json:"unavailable_shards"`
+		}
+		if json.Unmarshal(raw, &probe) != nil || probe.Ready == nil {
+			return nil, decodeAPIErrorBytes(resp.StatusCode, raw)
+		}
+		return &ReadyStatus{
+			Ready:             *probe.Ready,
+			UnavailableShards: probe.UnavailableShards,
+		}, nil
+	}
+	return nil, decodeAPIError(resp)
 }
 
 func (c *Client) newRequest(ctx context.Context, method, path string, body io.Reader, contentType string) (*http.Request, error) {
@@ -758,13 +1206,20 @@ func drainAndClose(rc io.ReadCloser) {
 	_ = rc.Close()
 }
 
-func decodeAPIError(resp *http.Response) error {
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorResponseBytes))
+func decodeAPIErrorBytes(statusCode int, raw []byte) error {
+	if len(raw) > maxErrorResponseBytes {
+		raw = raw[:maxErrorResponseBytes]
+	}
 	var errObj struct {
 		Error string `json:"error"`
 	}
 	if json.Unmarshal(raw, &errObj) == nil && errObj.Error != "" {
-		return &APIError{StatusCode: resp.StatusCode, Message: errObj.Error}
+		return &APIError{StatusCode: statusCode, Message: errObj.Error}
 	}
-	return &APIError{StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(raw))}
+	return &APIError{StatusCode: statusCode, Message: strings.TrimSpace(string(raw))}
+}
+
+func decodeAPIError(resp *http.Response) error {
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorResponseBytes))
+	return decodeAPIErrorBytes(resp.StatusCode, raw)
 }
