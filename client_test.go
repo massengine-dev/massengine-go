@@ -6,9 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -115,8 +115,8 @@ func TestClientSDKLifecycle(t *testing.T) {
 	if err != nil || q.Plan != "pro" || q.MaxDocs != 100 || q.MaxBytes != 1073741824 {
 		t.Fatalf("SetTenantQuota: %+v, err=%v", q, err)
 	}
-	if gotUA, _ := seenUserAgent.Load().(string); gotUA != "massengine-go/1.1.4" {
-		t.Fatalf("expected User-Agent massengine-go/1.1.4, got %q", gotUA)
+	if gotUA, _ := seenUserAgent.Load().(string); gotUA != "massengine-go/1.2.0" {
+		t.Fatalf("expected User-Agent massengine-go/1.2.0, got %q", gotUA)
 	}
 
 	tKey, err := admin.CreateTenantKey(ctx, "acme", "")
@@ -161,12 +161,176 @@ func TestClientSDKLifecycle(t *testing.T) {
 	}
 }
 
-func TestSearchRequestRemovesQueryTextAndHybridAlpha(t *testing.T) {
-	rt := reflect.TypeOf(SearchRequest{})
-	for _, removed := range []string{"QueryText", "HybridAlpha"} {
-		if _, exists := rt.FieldByName(removed); exists {
-			t.Fatalf("SearchRequest must not expose %s", removed)
+func TestHybridLexicalAndSparseSearch(t *testing.T) {
+	var mu sync.Mutex
+	var searchBodies []map[string]any
+	var ingestDocs []Doc
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/tenants/{tenant}/ingest", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Docs []Doc `json:"docs"`
 		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		mu.Lock()
+		ingestDocs = append(ingestDocs, req.Docs...)
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(IngestResponse{Ingested: len(req.Docs)})
+	})
+	mux.HandleFunc("GET /v1/tenants/{tenant}/docs/{id...}", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(DocResponse{
+			ID:            r.PathValue("id"),
+			Tenant:        r.PathValue("tenant"),
+			SparseIndices: []uint32{10, 42},
+			SparseValues:  []float32{1.5, 0.75},
+			Metadata:      json.RawMessage(`{"title":"consensus raft"}`),
+		})
+	})
+	mux.HandleFunc("GET /v1/tenants/{tenant}/export", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, _ = w.Write([]byte("{\"id\":\"h-1\",\"vector\":[1,0],\"sparse_indices\":[10,42],\"sparse_values\":[1.5,0.75]}\n"))
+	})
+	mux.HandleFunc("POST /v1/search", func(w http.ResponseWriter, r *http.Request) {
+		var raw map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&raw)
+		mu.Lock()
+		searchBodies = append(searchBodies, raw)
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(SearchResponse{
+			Hits:   []Hit{{ID: "h-1", DocID: 1, Score: 0.0328}},
+			TookMs: 0.45,
+		})
+	})
+	mux.HandleFunc("POST /v1/search/batch", func(w http.ResponseWriter, r *http.Request) {
+		var raw struct {
+			Queries []map[string]any `json:"queries"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&raw)
+		mu.Lock()
+		searchBodies = append(searchBodies, raw.Queries...)
+		mu.Unlock()
+		res := make([]SearchResponse, len(raw.Queries))
+		for i := range res {
+			res[i] = SearchResponse{Hits: []Hit{{ID: "h-1", DocID: 1, Score: 1.2}}}
+		}
+		_ = json.NewEncoder(w).Encode(BatchSearchResponse{Results: res})
+	})
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	cli := New(Options{BaseURL: ts.URL, APIKey: "mk_hybrid"})
+	ctx := context.Background()
+
+	// 1. Ingest with sparse_indices + sparse_values
+	if _, err := cli.Ingest(ctx, "acme", []Doc{{
+		ID:            "h-1",
+		Vector:        []float32{1, 0},
+		SparseIndices: []uint32{10, 42},
+		SparseValues:  []float32{1.5, 0.75},
+		Metadata:      json.RawMessage(`{"title":"consensus raft"}`),
+	}}); err != nil {
+		t.Fatalf("Ingest sparse doc: %v", err)
+	}
+
+	gotDoc, err := cli.GetDoc(ctx, "acme", "h-1")
+	if err != nil || len(gotDoc.SparseIndices) != 2 || gotDoc.SparseIndices[1] != 42 || gotDoc.SparseValues[0] != 1.5 {
+		t.Fatalf("GetDoc sparse: %+v err=%v", gotDoc, err)
+	}
+	exported, err := cli.ExportTenant(ctx, "acme")
+	if err != nil || len(exported) != 1 || len(exported[0].SparseIndices) != 2 {
+		t.Fatalf("ExportTenant sparse: %+v err=%v", exported, err)
+	}
+
+	// 2. Pure BM25 lexical search (Vector omitted)
+	if _, err := cli.Search(ctx, SearchRequest{
+		Tenant:    "acme",
+		QueryText: "consensus raft",
+		K:         5,
+	}); err != nil {
+		t.Fatalf("Pure BM25 Search: %v", err)
+	}
+
+	// 3. Pure sparse vector search (Vector omitted)
+	if _, err := cli.Search(ctx, SearchRequest{
+		Tenant:        "acme",
+		SparseIndices: []uint32{10, 42},
+		SparseValues:  []float32{1.0, 0.5},
+		K:             5,
+	}); err != nil {
+		t.Fatalf("Pure Sparse Search: %v", err)
+	}
+
+	// 4. Hybrid dense + BM25 + sparse RRF with HybridAlpha & SkipMeta
+	alpha := float32(0.65)
+	if _, err := cli.Search(ctx, SearchRequest{
+		Tenant:        "acme",
+		Vector:        []float32{1, 0},
+		QueryText:     "consensus",
+		HybridAlpha:   &alpha,
+		SparseIndices: []uint32{10},
+		SparseValues:  []float32{0.8},
+		SkipMeta:      true,
+		K:             10,
+	}); err != nil {
+		t.Fatalf("Hybrid RRF Search: %v", err)
+	}
+
+	// 5. BatchSearch mixing pure BM25 and pure sparse
+	if _, err := cli.BatchSearch(ctx, []SearchRequest{
+		{Tenant: "acme", QueryText: "raft", K: 3},
+		{Tenant: "acme", SparseIndices: []uint32{42}, SparseValues: []float32{1.2}, K: 3},
+	}); err != nil {
+		t.Fatalf("Hybrid BatchSearch: %v", err)
+	}
+
+	mu.Lock()
+	if len(ingestDocs) != 1 || len(ingestDocs[0].SparseIndices) != 2 {
+		t.Fatalf("expected sparse fields in ingested doc, got %+v", ingestDocs)
+	}
+	if _, hasVec := searchBodies[0]["vector"]; hasVec {
+		t.Fatalf("pure BM25 search JSON should omit empty vector: %+v", searchBodies[0])
+	}
+	if _, hasVec := searchBodies[1]["vector"]; hasVec {
+		t.Fatalf("pure sparse search JSON should omit empty vector: %+v", searchBodies[1])
+	}
+	if searchBodies[2]["skip_meta"] != true || searchBodies[2]["query_text"] != "consensus" {
+		t.Fatalf("unexpected hybrid search body: %+v", searchBodies[2])
+	}
+	beforeCount := len(searchBodies)
+	mu.Unlock()
+
+	// 6. Client-side validation rejects invalid sparse/hybrid inputs without contacting server
+	badAlphaLow := float32(-0.1)
+	badAlphaHigh := float32(1.2)
+	badAlphaNaN := float32(math.NaN())
+	for _, badReq := range []SearchRequest{
+		{Tenant: "acme", QueryText: "   ", K: 5},
+		{Tenant: "acme", Vector: []float32{1, 0}, HybridAlpha: &badAlphaLow, K: 5},
+		{Tenant: "acme", Vector: []float32{1, 0}, HybridAlpha: &badAlphaHigh, K: 5},
+		{Tenant: "acme", Vector: []float32{1, 0}, HybridAlpha: &badAlphaNaN, K: 5},
+		{Tenant: "acme", SparseIndices: []uint32{1, 2}, SparseValues: []float32{0.5}, K: 5},
+		{Tenant: "acme", SparseIndices: []uint32{1}, SparseValues: []float32{float32(math.NaN())}, K: 5},
+		{Tenant: "acme", Vector: []float32{float32(math.Inf(1)), 0}, K: 5},
+	} {
+		if _, err := cli.Search(ctx, badReq); err == nil {
+			t.Fatalf("expected client-side error for invalid SearchRequest %+v", badReq)
+		}
+	}
+	if _, err := cli.Ingest(ctx, "acme", []Doc{{
+		ID:            "bad-sparse",
+		Vector:        []float32{1, 0},
+		SparseIndices: []uint32{1},
+		SparseValues:  []float32{0.5, 0.9},
+	}}); err == nil {
+		t.Fatal("expected client-side error for mismatched Doc sparse lengths")
+	}
+
+	mu.Lock()
+	afterCount := len(searchBodies)
+	mu.Unlock()
+	if afterCount != beforeCount {
+		t.Fatal("server should not be contacted when hybrid/sparse validation fails")
 	}
 }
 
