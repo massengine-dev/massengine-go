@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -19,7 +20,7 @@ import (
 
 const (
 	// Version is the semantic version of this SDK release.
-	Version = "1.1.4"
+	Version = "1.2.0"
 
 	defaultUserAgent        = "massengine-go/" + Version
 	defaultBaseURL          = "http://localhost:8081"
@@ -27,6 +28,7 @@ const (
 	defaultMaxResponseBytes = 64 << 20 // 64 MiB
 	maxErrorResponseBytes   = 64 << 10 // 64 KiB
 	keepAliveDrainBytes     = 4096
+	maxSparseTerms          = 65536
 )
 
 // Options configures a MassEngine HTTP Client.
@@ -252,12 +254,14 @@ func (e *APIError) Error() string {
 
 // Doc represents a document submitted via Ingest or ImportTenant.
 type Doc struct {
-	ID       string          `json:"id"`
-	Database string          `json:"database,omitempty"`
-	Vector   []float32       `json:"vector"`
-	Date     uint16          `json:"date,omitempty"`
-	Category uint16          `json:"category,omitempty"`
-	Metadata json.RawMessage `json:"metadata,omitempty"`
+	ID            string          `json:"id"`
+	Database      string          `json:"database,omitempty"`
+	Vector        []float32       `json:"vector"`
+	SparseIndices []uint32        `json:"sparse_indices,omitempty"`
+	SparseValues  []float32       `json:"sparse_values,omitempty"`
+	Date          uint16          `json:"date,omitempty"`
+	Category      uint16          `json:"category,omitempty"`
+	Metadata      json.RawMessage `json:"metadata,omitempty"`
 }
 
 // IngestResponse is returned by Ingest and IngestDatabase.
@@ -267,22 +271,30 @@ type IngestResponse struct {
 	Database string `json:"database,omitempty"`
 }
 
-// SearchRequest specifies a dense vector query with optional database scope,
-// metadata/date/category pre-filters, similarity threshold, and pagination offset.
+// SearchRequest specifies a dense vector, BM25 lexical, sparse vector, or
+// weighted RRF hybrid query with optional database scope, metadata/date/category
+// pre-filters, similarity threshold, and pagination offset.
 type SearchRequest struct {
 	Tenant         string         `json:"tenant,omitempty"`
 	Database       string         `json:"database,omitempty"`
-	Vector         []float32      `json:"vector"`
+	Vector         []float32      `json:"vector,omitempty"`
+	QueryText      string         `json:"query_text,omitempty"`
+	HybridAlpha    *float32       `json:"hybrid_alpha,omitempty"`
+	SparseIndices  []uint32       `json:"sparse_indices,omitempty"`
+	SparseValues   []float32      `json:"sparse_values,omitempty"`
 	MetadataFilter map[string]any `json:"metadata_filter,omitempty"`
 	K              int            `json:"k"`
 	Offset         int            `json:"offset,omitempty"`
 	MinScore       *float32       `json:"min_score,omitempty"`
 	RerankPool     int            `json:"rerank_pool,omitempty"`
 	NProbe         int            `json:"nprobe,omitempty"`
+	SkipMeta       bool           `json:"skip_meta,omitempty"`
 	MinDate        *uint16        `json:"min_date,omitempty"`
 	MaxDate        *uint16        `json:"max_date,omitempty"`
 	Category       *uint16        `json:"category,omitempty"`
 	Categories     []uint16       `json:"categories,omitempty"`
+	MinDocID       *uint64        `json:"min_doc_id,omitempty"`
+	MaxDocID       *uint64        `json:"max_doc_id,omitempty"`
 }
 
 // Hit is a single search result returned by Search or BatchSearch.
@@ -307,14 +319,16 @@ type BatchSearchResponse struct {
 
 // DocResponse is returned by GetDoc, PatchDoc, and BatchGetDocs.
 type DocResponse struct {
-	ID       string          `json:"id"`
-	Tenant   string          `json:"tenant,omitempty"`
-	Database string          `json:"database,omitempty"`
-	Date     uint16          `json:"date,omitempty"`
-	Category uint16          `json:"category,omitempty"`
-	Found    bool            `json:"found"`
-	Degraded bool            `json:"degraded,omitempty"`
-	Metadata json.RawMessage `json:"metadata,omitempty"`
+	ID            string          `json:"id"`
+	Tenant        string          `json:"tenant,omitempty"`
+	Database      string          `json:"database,omitempty"`
+	SparseIndices []uint32        `json:"sparse_indices,omitempty"`
+	SparseValues  []float32       `json:"sparse_values,omitempty"`
+	Date          uint16          `json:"date,omitempty"`
+	Category      uint16          `json:"category,omitempty"`
+	Found         bool            `json:"found"`
+	Degraded      bool            `json:"degraded,omitempty"`
+	Metadata      json.RawMessage `json:"metadata,omitempty"`
 }
 
 // PatchRequest specifies an in-place metadata, date, or category update without
@@ -430,6 +444,26 @@ type ReadyStatus struct {
 	UnavailableShards []int `json:"unavailable_shards,omitempty"`
 }
 
+func validateFiniteFloats(vals []float32, label string) error {
+	for _, v := range vals {
+		f := float64(v)
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return fmt.Errorf("massengine: %s must contain finite numbers", label)
+		}
+	}
+	return nil
+}
+
+func validateSparseVector(indices []uint32, values []float32) error {
+	if len(indices) != len(values) {
+		return errors.New("massengine: sparse_indices and sparse_values must have equal length")
+	}
+	if len(indices) > maxSparseTerms {
+		return fmt.Errorf("massengine: sparse vector exceeds maximum of %d terms", maxSparseTerms)
+	}
+	return validateFiniteFloats(values, "sparse_values")
+}
+
 func validateDocs(docs []Doc) error {
 	for i := range docs {
 		if err := validateDocID(docs[i].ID); err != nil {
@@ -439,6 +473,12 @@ func validateDocs(docs []Doc) error {
 			if _, err := escapeDatabase(docs[i].Database); err != nil {
 				return fmt.Errorf("doc %d: %w", i, err)
 			}
+		}
+		if err := validateFiniteFloats(docs[i].Vector, "vector"); err != nil {
+			return fmt.Errorf("doc %d: %w", i, err)
+		}
+		if err := validateSparseVector(docs[i].SparseIndices, docs[i].SparseValues); err != nil {
+			return fmt.Errorf("doc %d: %w", i, err)
 		}
 	}
 	return nil
@@ -489,8 +529,23 @@ func (c *Client) IngestDatabase(ctx context.Context, tenant, database string, do
 }
 
 func validateSearchRequest(req SearchRequest) error {
-	if len(req.Vector) == 0 {
-		return errors.New("massengine: search vector must be non-empty")
+	if err := validateSparseVector(req.SparseIndices, req.SparseValues); err != nil {
+		return err
+	}
+	if err := validateFiniteFloats(req.Vector, "search vector"); err != nil {
+		return err
+	}
+	hasDense := len(req.Vector) > 0
+	hasLexical := strings.TrimSpace(req.QueryText) != ""
+	hasSparse := len(req.SparseIndices) > 0
+	if !hasDense && !hasLexical && !hasSparse {
+		return errors.New("massengine: search requires vector, query_text, or sparse_indices")
+	}
+	if req.HybridAlpha != nil {
+		a := float64(*req.HybridAlpha)
+		if math.IsNaN(a) || math.IsInf(a, 0) || a < 0 || a > 1 {
+			return errors.New("massengine: hybrid_alpha must be between 0 and 1")
+		}
 	}
 	if req.Tenant != "" {
 		if _, err := escapeTenant(req.Tenant); err != nil {
@@ -505,8 +560,8 @@ func validateSearchRequest(req SearchRequest) error {
 	return nil
 }
 
-// Search executes a single dense vector query with optional metadata, date, and
-// category filters.
+// Search executes a dense vector, BM25 lexical, sparse vector, or hybrid query
+// with optional metadata, date, and category filters.
 func (c *Client) Search(ctx context.Context, req SearchRequest) (*SearchResponse, error) {
 	if c.initErr != nil {
 		return nil, c.initErr

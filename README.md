@@ -1,11 +1,11 @@
 # MassEngine Go SDK (`massengine-go`)
 
-Official zero-dependency Go client for [MassEngine](https://massengine.com) — the sub-5ms filtered vector search database.
+Official zero-dependency Go client for [MassEngine](https://massengine.com) — the sub-5ms filtered vector and hybrid search database.
 
 ## Installation
 
 ```bash
-go get github.com/massengine-dev/massengine-go@v1.1.4
+go get github.com/massengine-dev/massengine-go@v1.2.0
 ```
 
 ## Quickstart
@@ -50,6 +50,17 @@ func main() {
 		},
 	})
 	fmt.Printf("Hits: %+v\n", res.Hits)
+
+	// 3. Hybrid search (dense + BM25 lexical + sparse vectors with weighted RRF)
+	alpha := float32(0.6)
+	hybridRes, _ := cli.Search(ctx, massengine.SearchRequest{
+		Tenant:      "acme-prod",
+		Vector:      []float32{0.12, -0.44, 0.88, 0.05},
+		QueryText:   "soc2 security policy",
+		HybridAlpha: &alpha,
+		K:           10,
+	})
+	fmt.Printf("Hybrid hits: %+v\n", hybridRes.Hits)
 }
 ```
 
