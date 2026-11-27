@@ -547,6 +547,12 @@ func validateSearchRequest(req SearchRequest) error {
 			return errors.New("massengine: hybrid_alpha must be between 0 and 1")
 		}
 	}
+	if req.MinScore != nil {
+		ms := float64(*req.MinScore)
+		if math.IsNaN(ms) || math.IsInf(ms, 0) {
+			return errors.New("massengine: min_score must be a finite number")
+		}
+	}
 	if req.Tenant != "" {
 		if _, err := escapeTenant(req.Tenant); err != nil {
 			return err
