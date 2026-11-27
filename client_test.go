@@ -771,15 +771,32 @@ func TestMultiDatabaseCRUDAndScopedDataPlane(t *testing.T) {
 		}
 
 		return405OnGetDB.Store(false)
+		mu.Lock()
+		beforeDirect := len(requests)
+		mu.Unlock()
 		gotDB, err := cli.GetDatabase(ctx, tenant, "analytics")
-		if err != nil || gotDB.Database != "analytics" || gotDB.DocCount != 10 {
-			t.Fatalf("GetDatabase(%q) direct: %+v err=%v", tenant, gotDB, err)
+		mu.Lock()
+		directCount := len(requests) - beforeDirect
+		mu.Unlock()
+		if err != nil || gotDB.Database != "analytics" || gotDB.DocCount != 10 || directCount != 1 {
+			t.Fatalf("GetDatabase(%q) direct: %+v count=%d err=%v", tenant, gotDB, directCount, err)
 		}
 
 		return405OnGetDB.Store(true)
+		mu.Lock()
+		beforeFB := len(requests)
+		mu.Unlock()
 		gotFallback, err := cli.GetDatabase(ctx, tenant, "analytics")
-		if err != nil || gotFallback.Database != "analytics" {
-			t.Fatalf("GetDatabase(%q) 405 fallback: %+v err=%v", tenant, gotFallback, err)
+		mu.Lock()
+		fbCount := len(requests) - beforeFB
+		mu.Unlock()
+		if err != nil || gotFallback.Database != "analytics" || fbCount != 2 {
+			t.Fatalf("GetDatabase(%q) 405 fallback: %+v count=%d err=%v", tenant, gotFallback, fbCount, err)
+		}
+		_, missErr := cli.GetDatabase(ctx, tenant, "nonexistent")
+		var apiMiss *APIError
+		if !errors.As(missErr, &apiMiss) || apiMiss.StatusCode != http.StatusNotFound {
+			t.Fatalf("expected 404 APIError for missing database on 405 fallback, got: %v", missErr)
 		}
 
 		deletedCount, err := cli.DeleteDatabase(ctx, tenant, "analytics")
@@ -845,4 +862,144 @@ func TestMultiDatabaseCRUDAndScopedDataPlane(t *testing.T) {
 		t.Fatalf("expected ?database=analytics on /v1/import and /v1/export, got requests: %v", requests)
 	}
 	_ = bodies
+}
+
+func TestMinScoreNaNAndInfRejectedClientSide(t *testing.T) {
+	var hitServer atomic.Bool
+	var seenMinScore atomic.Value
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if _, ok := body["min_score"]; ok {
+			seenMinScore.Store(body["min_score"])
+		}
+		if r.URL.Path == "/v1/search/batch" {
+			_ = json.NewEncoder(w).Encode(BatchSearchResponse{Results: []SearchResponse{{Hits: []Hit{}}}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(SearchResponse{Hits: []Hit{}})
+	}))
+	defer ts.Close()
+
+	// Wrap handler check before assigning final test handler
+	ts.Close()
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, _ := io.ReadAll(r.Body)
+		var body map[string]any
+		_ = json.Unmarshal(bodyBytes, &body)
+		if _, ok := body["queries"]; ok {
+			_ = json.NewEncoder(w).Encode(BatchSearchResponse{Results: []SearchResponse{{Hits: []Hit{}}}})
+			return
+		}
+		hitServer.Store(true)
+		seenMinScore.Store(body["min_score"])
+		_ = json.NewEncoder(w).Encode(SearchResponse{Hits: []Hit{}})
+	}))
+	defer ts.Close()
+
+	cli := New(Options{BaseURL: ts.URL, APIKey: "mk_test"})
+	ctx := context.Background()
+
+	// Valid finite MinScore (0 and negative) succeeds
+	zero := float32(0)
+	if _, err := cli.Search(ctx, SearchRequest{Tenant: "acme", Vector: []float32{1, 0}, K: 5, MinScore: &zero}); err != nil {
+		t.Fatalf("finite MinScore=0 failed: %v", err)
+	}
+	neg := float32(-0.25)
+	if _, err := cli.Search(ctx, SearchRequest{Tenant: "acme", Vector: []float32{1, 0}, K: 5, MinScore: &neg}); err != nil {
+		t.Fatalf("finite MinScore=-0.25 failed: %v", err)
+	}
+	if _, err := cli.BatchSearch(ctx, []SearchRequest{{Tenant: "acme", Vector: []float32{1, 0}, K: 5, MinScore: &neg}}); err != nil {
+		t.Fatalf("BatchSearch finite MinScore=-0.25 failed: %v", err)
+	}
+
+	hitServer.Store(false)
+	for _, badVal := range []float32{float32(math.NaN()), float32(math.Inf(1)), float32(math.Inf(-1))} {
+		ms := badVal
+		_, err := cli.Search(ctx, SearchRequest{Tenant: "acme", Vector: []float32{1, 0}, K: 5, MinScore: &ms})
+		if err == nil || !strings.Contains(err.Error(), "min_score") {
+			t.Fatalf("expected min_score validation error for %v, got: %v", badVal, err)
+		}
+		_, bErr := cli.BatchSearch(ctx, []SearchRequest{{Tenant: "acme", Vector: []float32{1, 0}, K: 5, MinScore: &ms}})
+		if bErr == nil || !strings.Contains(bErr.Error(), "min_score") {
+			t.Fatalf("expected min_score validation error in BatchSearch for %v, got: %v", badVal, bErr)
+		}
+	}
+	if hitServer.Load() {
+		t.Fatal("server must not be contacted when MinScore is NaN/Inf")
+	}
+}
+
+func TestAdminLifecycleAndCustomHTTPClient(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/tenants", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tenants": []TenantSummary{{Tenant: "acme", DocCount: 5, ByteCount: 2048}},
+		})
+	})
+	mux.HandleFunc("DELETE /v1/tenants/{tenant}", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"docs_deleted": 5})
+	})
+	mux.HandleFunc("GET /v1/tenants/{tenant}/quota", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"quota": TenantQuota{Plan: "pro", MaxDocs: 500, MaxBytes: 4096, MaxQPS: 100},
+		})
+	})
+	mux.HandleFunc("DELETE /v1/tenants/{tenant}/keys", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"revoked": true})
+	})
+	mux.HandleFunc("POST /v1/flush", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"flushed": true})
+	})
+	mux.HandleFunc("POST /v1/compact", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"compacted": true})
+	})
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	callerHC := &http.Client{Timeout: 5 * time.Second}
+	cli, err := NewClient(Options{
+		BaseURL:    ts.URL,
+		APIKey:     "meadm_admin",
+		HTTPClient: callerHC,
+		Timeout:    15 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewClient custom HTTPClient: %v", err)
+	}
+	if callerHC.Timeout != 5*time.Second || callerHC.CheckRedirect != nil {
+		t.Fatal("NewClient mutated caller's HTTPClient")
+	}
+
+	var nilCli *Client
+	if nilCli.String() != "<nil>" || nilCli.GoString() != "<nil>" {
+		t.Fatalf("unexpected nil Client formatting: %q", nilCli.String())
+	}
+	if !strings.Contains(cli.GoString(), ts.URL) || strings.Contains(cli.GoString(), "meadm_admin") {
+		t.Fatalf("unexpected Client GoString: %q", cli.GoString())
+	}
+
+	ctx := context.Background()
+	tenants, err := cli.ListTenants(ctx)
+	if err != nil || len(tenants) != 1 || tenants[0].Tenant != "acme" {
+		t.Fatalf("ListTenants: %+v err=%v", tenants, err)
+	}
+	q, err := cli.GetTenantQuota(ctx, "acme")
+	if err != nil || q.Plan != "pro" || q.MaxDocs != 500 {
+		t.Fatalf("GetTenantQuota: %+v err=%v", q, err)
+	}
+	if err := cli.RevokeTenantKey(ctx, "acme", "mk_old"); err != nil {
+		t.Fatalf("RevokeTenantKey: %v", err)
+	}
+	if err := cli.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if err := cli.Compact(ctx); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	deleted, err := cli.DeleteTenant(ctx, "acme")
+	if err != nil || deleted != 5 {
+		t.Fatalf("DeleteTenant: %d err=%v", deleted, err)
+	}
 }
